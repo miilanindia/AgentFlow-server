@@ -7,7 +7,7 @@ router = APIRouter()
 
 @router.websocket("/ws/agent/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
-    await ws_manager.connect(websocket)
+    await ws_manager.connect(websocket, task_id)
     try:
         while True:
             # Receive text or JSON messages from client if any (mostly for interactive commands or ping-pong)
@@ -24,7 +24,7 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 await websocket.send_json({"type": "error", "message": "Invalid JSON format"})
                 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        ws_manager.disconnect(task_id)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-        ws_manager.disconnect(websocket)
+        ws_manager.disconnect(task_id)

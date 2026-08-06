@@ -1,35 +1,64 @@
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from typing import List, Optional, Dict, Any
 import uuid
-from datetime import datetime
+
+from app.database.session import get_db
+from app.database.models import Task, JobResult, TimelineEvent
 
 router = APIRouter()
 
-# class JobResultMockResponse(BaseModel):
-#     id: uuid.UUID
-#     task_id: uuid.UUID
-#     status: str
-#     output: Optional[Dict[str, Any]] = None
-#     error_message: Optional[str] = None
-#     created_at: datetime
-
-# @router.get("", response_model=List[JobResultMockResponse])
-# async def get_results(limit: int = 10):
-#     # Return mock results list
-#     mock_id = uuid.uuid4()
-#     mock_task_id = uuid.uuid4()
-#     return [
-#         JobResultMockResponse(
-#             id=mock_id,
-#             task_id=mock_task_id,
-#             status="completed",
-#             output={"extracted_data": "example data", "screenshot_url": "/mock/screenshot.png"},
-#             error_message=None,
-#             created_at=datetime.utcnow()
-#         )
-#     ]
-
 @router.get("/")
-async def get_all_results():
-    return {"message": "Results are streamed live via WebSocket. No static mock data."}
+async def get_all_results(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Task).options(selectinload(Task.job_result), selectinload(Task.timeline_events))
+    )
+    tasks = result.scalars().all()
+    return [
+        {
+            "task_id": str(t.id),
+            "description": t.description,
+            "status": t.status,
+            "created_at": t.created_at,
+            "job_result": t.job_result.output if t.job_result else None,
+            "error_message": t.job_result.error_message if t.job_result else None,
+            "timeline_events_count": len(t.timeline_events)
+        }
+        for t in tasks
+    ]
+
+@router.get("/{task_id}")
+async def get_result_by_id(task_id: str, db: AsyncSession = Depends(get_db)):
+    try:
+        task_uuid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid task UUID format")
+        
+    result = await db.execute(
+        select(Task)
+        .where(Task.id == task_uuid)
+        .options(selectinload(Task.job_result), selectinload(Task.timeline_events))
+    )
+    task = result.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+        
+    return {
+        "task_id": str(task.id),
+        "description": task.description,
+        "status": task.status,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "job_result": task.job_result.output if task.job_result else None,
+        "error_message": task.job_result.error_message if task.job_result else None,
+        "timeline_events": [
+            {
+                "event_type": ev.event_type,
+                "details": ev.details,
+                "created_at": ev.created_at
+            }
+            for ev in task.timeline_events
+        ]
+    }

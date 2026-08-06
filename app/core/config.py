@@ -7,11 +7,21 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     
     # Database Configuration
-    # Example: postgresql+asyncpg://user:password@localhost:5432/dbname
-    DATABASE_URL: str
+    DATABASE_URL: str = "sqlite+aiosqlite:///./agentflow.db"
     
     # CORS Configuration
-    CORS_ORIGINS: List[str] = ["http://localhost:3000"]
+    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
+    
+    # API Keys (Yeh add hona zaroori tha)
+    GOOGLE_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
+    
+    # Agent & Token Limits
+    MAX_TOOL_ITERATIONS: int = 4
+    MAX_HISTORY_MESSAGES: int = 6
+    MAX_PAGE_TEXT_CHARS: int = 2000
+    MAX_SEARCH_RESULTS: int = 5
     
     model_config = SettingsConfigDict(
         env_file=".env",

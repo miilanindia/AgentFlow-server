@@ -22,8 +22,13 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 target_metadata = Base.metadata
 
-# Set sqlalchemy.url from our settings to avoid hardcoding in alembic.ini
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+db_url = settings.DATABASE_URL or ""
+if db_url.startswith("postgresql://"):
+    db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+if "asyncpg" in db_url and "sslmode=" in db_url:
+    db_url = db_url.replace("sslmode=require", "ssl=require").replace("sslmode=prefer", "ssl=prefer").replace("sslmode=disable", "ssl=disable")
+
+config.set_main_option("sqlalchemy.url", db_url)
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.

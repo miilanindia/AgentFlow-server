@@ -4,9 +4,19 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 
+# Normalize Database URL for Async Engine
+raw_url = settings.DATABASE_URL or "sqlite+aiosqlite:///./agentflow.db"
+async_url = raw_url
+
+if async_url.startswith("postgresql://"):
+    async_url = async_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+if "asyncpg" in async_url and "sslmode=" in async_url:
+    async_url = async_url.replace("sslmode=require", "ssl=require").replace("sslmode=prefer", "ssl=prefer").replace("sslmode=disable", "ssl=disable")
+
 # Async Engine setup (for FastAPI async routes)
 async_engine = create_async_engine(
-    settings.DATABASE_URL,
+    async_url,
     echo=settings.DEBUG,
     future=True,
     pool_pre_ping=True
@@ -20,9 +30,8 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False
 )
 
-# Sync engine setup (mostly for Alembic if not using async alembic environment, but Alembic can be configured for async)
-# If settings.DATABASE_URL uses `postgresql+asyncpg`, we need to replace it for sync engine
-sync_url = settings.DATABASE_URL.replace("+asyncpg", "") if settings.DATABASE_URL else ""
+# Sync engine setup (mostly for Alembic)
+sync_url = raw_url.replace("+asyncpg", "").replace("ssl=require", "sslmode=require") if raw_url else ""
 
 sync_engine = create_engine(
     sync_url,
