@@ -42,7 +42,7 @@ class BrowserController:
         logger.info("[BROWSER] Launching Chromium browser with Playwright...")
         self.playwright = sync_playwright().start()
         # Stealth mode ke saath launch
-        self.browser = self.playwright.chromium.launch(headless=False, args=["--start-maximized"])
+        self.browser = self.playwright.chromium.launch(headless=True, args=["--start-maximized"])
         logger.info("[BROWSER] Browser launched. Creating new context...")
         context = self.browser.new_context(viewport={"width": 1280, "height": 800})
         

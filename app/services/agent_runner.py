@@ -10,14 +10,15 @@ from app.core.logger import logger
 from app.database.database import AsyncSessionLocal
 from app.database.models import Task, TimelineEvent, JobResult
 
-async def db_create_task(task_id: str, goal: str):
+async def db_create_task(task_id: str, goal: str, user_id: str = None):
     try:
         async with AsyncSessionLocal() as db:
             task_uuid = uuid.UUID(task_id)
-            new_task = Task(id=task_uuid, description=goal, status="running")
+            user_uuid = uuid.UUID(user_id) if user_id else None
+            new_task = Task(id=task_uuid, description=goal, status="running",user_id=user_uuid)
             db.add(new_task)
             await db.commit()
-            logger.info(f"[DB] Inserted Task record for {task_id}")
+            logger.info(f"[DB] Inserted Task record for {task_id} with owner {user_id}")
     except Exception as e:
         logger.error(f"[DB ERROR] Failed to create Task {task_id}: {e}")
 
@@ -59,11 +60,11 @@ class AgentRunner:
     def __init__(self):
         self.active_tasks = {}
 
-    async def run_agent(self, task_id: str, goal: str):
+    async def run_agent(self, task_id: str, goal: str, user_id: str =None):
         logger.info(f"[RUNNER] Starting agent execution for Task {task_id} with goal: '{goal}'")
         
         # 1. DB Row insertion at task start
-        await db_create_task(task_id, goal)
+        await db_create_task(task_id, goal, user_id=user_id)
         
         # 2. Live WebSocket timeline event
         await ws_manager.send_timeline_event(task_id, "info", {"message": f"Starting agent for goal: {goal}"})
@@ -210,11 +211,18 @@ class AgentRunner:
             )
             await ws_manager.send_status_update(task_id, task_status, "Agent finished execution")
             await ws_manager.send_timeline_event(task_id, "complete", {"message": "Agent finished execution."})
+            
+            try:
+                from app.database.database import async_engine
+                await async_engine.dispose()
+                logger.info("[RUNNER] Database connection pool disposed successfully.")
+            except Exception as de:
+                logger.warning(f"[RUNNER] Database pool disposal failed: {de}")
 
-    def approve_task(self, task_id: str):
-        resolve_approval(task_id, approved=True)
+    async def approve_task(self, task_id: str):
+        await resolve_approval(task_id, approved=True)
 
-    def reject_task(self, task_id: str):
-        resolve_approval(task_id, approved=False)
+    async def reject_task(self, task_id: str):
+        await resolve_approval(task_id, approved=False)
 
 agent_runner = AgentRunner()

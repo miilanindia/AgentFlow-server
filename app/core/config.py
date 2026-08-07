@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     # CORS Configuration
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
     
+    # Redis Configuration
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+     # JWT Configuration  ← YE NAYA ADD KARNA HAI
+    JWT_SECRET: str = "agentflow_super_secret_key_123!"
+    JWT_ALGORITHM: str = "HS256"
+    
     # API Keys (Yeh add hona zaroori tha)
     GOOGLE_API_KEY: str = ""
     OPENAI_API_KEY: str = ""

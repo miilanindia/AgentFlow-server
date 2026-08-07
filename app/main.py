@@ -16,6 +16,7 @@ from app.database.models import Base
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.websocket.manager import ws_manager
     logger.info("Initializing database tables...")
     try:
         async with async_engine.begin() as conn:
@@ -23,7 +24,18 @@ async def lifespan(app: FastAPI):
         logger.info("Database tables initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize database tables: {e}")
+        
+    # Start Redis subscriber for websocket communication
+    redis_listener_task = asyncio.create_task(ws_manager.listen_to_redis())
+    
     yield
+    
+    # Clean up Redis subscriber on shutdown
+    redis_listener_task.cancel()
+    try:
+        await redis_listener_task
+    except asyncio.CancelledError:
+        pass
 
 def create_app() -> FastAPI:
     # Setup logger
@@ -42,7 +54,7 @@ def create_app() -> FastAPI:
     # CORS configuration (Allow all for dev)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Changed to * for dev to avoid CORS issues
+        allow_origins=["http://localhost:3000", "https://yourdomain.com"],  # Changed to * for dev to avoid CORS issues
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -58,7 +70,7 @@ def create_app() -> FastAPI:
     from app.websocket.routes import router as ws_router
     
     # YAHAN /api PREFIX ADD KIYA HAI
-    app.include_router(api_router, prefix="/api")
+    app.include_router(api_router, prefix="/api", tags=["Auth"])
     app.include_router(ws_router)
 
     return app
