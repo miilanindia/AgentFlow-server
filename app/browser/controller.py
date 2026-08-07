@@ -44,13 +44,12 @@ class BrowserController:
         # Stealth mode ke saath launch
         self.browser = self.playwright.chromium.launch(headless=True, args=["--start-maximized"])
         logger.info("[BROWSER] Browser launched. Creating new context...")
-        context = self.browser.new_context(viewport={"width": 1280, "height": 800})
-        
-        # Real browser jaisa User-Agent set kar rahe hain
-        context.set_extra_http_headers({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        
+        context = self.browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            timezone_id="America/New_York"
+        )
         self.page = context.new_page()
         logger.info("[BROWSER] New page created in context.")
         
@@ -127,6 +126,30 @@ class BrowserController:
         text = self.page.inner_text("body")
         logger.info(f"[BROWSER] Extracted {len(text)} characters of body text.")
         
+        interactive_text = ""
+        # Extract Buttons and Fillable Inputs for LLM Grounding
+        try:
+            buttons = self.page.eval_on_selector_all(
+                "button, [role='button'], input[type='submit'], input[type='button']",
+                "els => els.map(el => ({text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim()})).filter(b => b.text && b.text.length < 60)"
+            )
+            if buttons:
+                interactive_text += "\n\n--- CLICKABLE BUTTONS & ELEMENTS ---\n"
+                for b in buttons[:25]:
+                    interactive_text += f"- Button: \"{b['text']}\"\n"
+
+            inputs = self.page.eval_on_selector_all(
+                "input:not([type='hidden']):not([type='submit']):not([type='button']), textarea, select",
+                "els => els.map(el => ({placeholder: el.placeholder || '', name: el.name || el.id || '', label: el.getAttribute('aria-label') || ''}))"
+            )
+            if inputs:
+                interactive_text += "\n\n--- FILLABLE INPUT FIELDS ---\n"
+                for inp in inputs[:15]:
+                    desc = inp['placeholder'] or inp['label'] or inp['name'] or 'input'
+                    interactive_text += f"- Input field: placeholder/name=\"{desc}\"\n"
+        except Exception as e:
+            logger.warning(f"[BROWSER] Failed to extract interactive elements: {e}")
+
         # Links extract karo taaki LLM ko 'Apply' URL mile
         try:
             logger.info("[BROWSER] Extracting available links on page...")
@@ -138,10 +161,119 @@ class BrowserController:
             for l in links[:50]: # Top 50 links
                 link_text += f"{l['text'].strip()} -> {l['href']}\n"
             logger.info(f"[BROWSER] Found {len(links)} links, appended top {min(len(links), 50)} to text.")
-            return text + link_text
+            return text + interactive_text + link_text
         except Exception as e:
             logger.warning(f"[BROWSER] Failed to extract links: {e}")
-            return text
+            return text + interactive_text
+
+    def _click_element_sync(self, target: str) -> str:
+        target = target.strip()
+        logger.info(f"[BROWSER] Attempting to click element matching: '{target}'")
+        try:
+            loc = None
+            if target.startswith("#") or target.startswith(".") or target.startswith("button["):
+                loc = self.page.locator(target).first
+            else:
+                button_loc = self.page.get_by_role("button", name=target, exact=False)
+                if button_loc.count() > 0:
+                    loc = button_loc.first
+                else:
+                    text_loc = self.page.get_by_text(target, exact=False)
+                    if text_loc.count() > 0:
+                        loc = text_loc.first
+                    else:
+                        loc = self.page.locator(f"button:has-text('{target}'), a:has-text('{target}'), [role='button']:has-text('{target}')").first
+
+            # Search submit button fallback
+            if not loc or loc.count() == 0:
+                target_lower = target.lower()
+                if any(kw in target_lower for kw in ["search", "find", "submit"]):
+                    for selector in ["button[type='submit']", "input[type='submit']", "button:has-text('Search')", "button:has-text('Find')", "button:has-text('Search jobs')"]:
+                        candidate = self.page.locator(selector).first
+                        if candidate.count() > 0 and candidate.is_visible():
+                            loc = candidate
+                            break
+
+            if loc and loc.count() > 0:
+                try:
+                    loc.click(timeout=3000)
+                except Exception:
+                    logger.info(f"[BROWSER] Standard click failed for '{target}', attempting JS evaluation click...")
+                    loc.evaluate("el => el.click()")
+                self.page.wait_for_timeout(1000)
+                return f"Successfully clicked element '{target}'."
+            return f"ERROR: Element '{target}' not found."
+        except Exception as e:
+            logger.error(f"[BROWSER] Failed to click '{target}': {e}")
+            return f"ERROR: Could not click '{target}': {e}."
+
+    def _fill_input_sync(self, target: str, value: str) -> str:
+        target = target.strip()
+        logger.info(f"[BROWSER] Attempting to fill input matching '{target}' with value '{value}'")
+        try:
+            loc = None
+            by_placeholder = self.page.get_by_placeholder(target, exact=False)
+            if by_placeholder.count() > 0:
+                loc = by_placeholder.first
+            else:
+                by_label = self.page.get_by_label(target, exact=False)
+                if by_label.count() > 0:
+                    loc = by_label.first
+                else:
+                    loc = self.page.locator(f"input[name*='{target}'], input[id*='{target}'], input[placeholder*='{target}'], textarea[name*='{target}'], select[name*='{target}'], select[id*='{target}']").first
+
+            # Case-insensitive attribute sub-match fallback
+            if not loc or loc.count() == 0:
+                target_lower = target.lower()
+                for attr in ["placeholder", "aria-label", "name", "id"]:
+                    candidate = self.page.locator(f"input[{attr}*='{target_lower}' i], textarea[{attr}*='{target_lower}' i]").first
+                    if candidate.count() > 0:
+                        loc = candidate
+                        break
+
+            # Search query text field fallback
+            if not loc or loc.count() == 0:
+                target_lower = target.lower()
+                if any(kw in target_lower for kw in ["search", "job", "title", "role", "keyword"]):
+                    for selector in ["input[type='search']", "input[type='text']", "input:not([type])", "textarea"]:
+                        candidate = self.page.locator(selector).first
+                        if candidate.count() > 0 and candidate.is_visible():
+                            loc = candidate
+                            break
+
+            # Location field fallback
+            if not loc or loc.count() == 0:
+                target_lower = target.lower()
+                if any(kw in target_lower for kw in ["location", "city", "state", "country", "where"]):
+                    loc_candidate = self.page.locator("input[placeholder*='location' i], input[name*='location' i], input[id*='location' i]").first
+                    if loc_candidate.count() > 0:
+                        loc = loc_candidate
+                    else:
+                        candidates = self.page.locator("input[type='text'], input:not([type])")
+                        if candidates.count() > 1:
+                            loc = candidates.nth(1)
+
+            if loc and loc.count() > 0:
+                tag_name = loc.evaluate("el => el.tagName.toLowerCase()")
+                if tag_name == "select":
+                    try:
+                        loc.select_option(label=value, timeout=3000)
+                    except Exception:
+                        loc.select_option(value=value, timeout=3000)
+                    return f"Successfully selected '{value}' in dropdown '{target}'."
+                else:
+                    loc.fill(value, timeout=3000)
+                    if any(s in target.lower() for s in ["search", "query", "filter", "find"]):
+                        try:
+                            loc.press("Enter")
+                        except Exception:
+                            pass
+                    self.page.wait_for_timeout(1000)
+                    return f"Successfully typed '{value}' into input '{target}'."
+            return f"ERROR: Input '{target}' not found."
+        except Exception as e:
+            logger.error(f"[BROWSER] Failed to fill input '{target}': {e}")
+            return f"ERROR: Could not fill input '{target}': {e}."
 
     def _get_search_results_sync(self, max_results: int = 5):
         """
@@ -151,10 +283,10 @@ class BrowserController:
         logger.info(f"[BROWSER] Extracting DuckDuckGo search results (max={max_results})...")
         try:
             raw_results = self.page.eval_on_selector_all(
-                "a.result__a",
+                "a.result__a, a.result-link, td a.result-link, li.b_algo h2 a, a[rel='nofollow']",
                 "els => els.map(el => ({title: el.innerText, url: el.href}))",
             )
-            logger.info(f"[BROWSER] Parsed {len(raw_results)} raw search result links from DuckDuckGo.")
+            logger.info(f"[BROWSER] Parsed {len(raw_results)} raw search result links from search engine.")
             
             results = []
             for r in raw_results:
@@ -209,6 +341,14 @@ class BrowserController:
     async def get_page_text(self) -> str:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, self._get_page_text_sync)
+
+    async def click_element(self, target: str) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.executor, self._click_element_sync, target)
+
+    async def fill_input(self, target: str, value: str) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.executor, self._fill_input_sync, target, value)
 
     async def get_search_results(self, max_results: int = 5):
         loop = asyncio.get_running_loop()

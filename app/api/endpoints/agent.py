@@ -77,3 +77,15 @@ async def resume_agent(
     await _get_owned_task(task_id, current_user, db)
     await task_control.resume(task_id)
     return {"task_id": task_id, "status": "resumed"}
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_agent(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    await _get_owned_task(task_id, current_user, db)
+    await task_control.cancel(task_id)
+    await agent_runner.reject_task(task_id) # Also unblock if waiting at approval node
+    return {"task_id": task_id, "status": "cancelled"}

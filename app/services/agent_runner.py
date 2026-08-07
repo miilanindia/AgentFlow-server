@@ -3,7 +3,7 @@ import uuid
 from typing import Dict, Any, List
 
 from app.agent.graph import app_graph
-from app.agent.control import resolve_approval, task_control
+from app.agent.control import resolve_approval, task_control, TaskCancelledException
 from app.browser.controller import browser_manager
 from app.websocket.manager import ws_manager
 from app.core.logger import logger
@@ -191,6 +191,12 @@ class AgentRunner:
                         await ws_manager.send_timeline_event(task_id, "results", {"message": "Task completed.", "data": final_jobs_delivered})
                         await db_add_timeline_event(task_id, "results", {"message": "Task completed.", "data": final_jobs_delivered})
                         
+        except TaskCancelledException as tce:
+            logger.info(f"[RUNNER] Task {task_id} was cancelled by user: {tce}")
+            task_status = "failed"
+            error_message = "Execution cancelled by operator."
+            await ws_manager.send_timeline_event(task_id, "error", {"message": "Execution cancelled by operator."})
+            await db_add_timeline_event(task_id, "error", {"message": "Execution cancelled by operator."})
         except Exception as e:
             logger.exception(f"[RUNNER] Exception encountered in graph execution for Task {task_id}: {e}")
             task_status = "failed"

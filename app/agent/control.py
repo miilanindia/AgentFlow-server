@@ -61,8 +61,13 @@ async def resolve_approval(task_id: str, approved: bool) -> bool:
     return True
 
 
+class TaskCancelledException(Exception):
+    """Raised when an active task is cancelled by human operator."""
+    pass
+
+
 class TaskControl:
-    """Manages live task pause and resume states using Redis."""
+    """Manages live task pause, resume, and cancellation states using Redis."""
 
     async def pause(self, task_id: str):
         redis = await get_redis()
@@ -85,8 +90,24 @@ class TaskControl:
         while await redis.get(f"paused_{task_id}") == b"1":
             await asyncio.sleep(1)
 
+    async def cancel(self, task_id: str):
+        redis = await get_redis()
+        await redis.set(f"cancelled_{task_id}", "1")
+        logger.info(f"Task {task_id} cancelled via Redis.")
+
+    async def is_cancelled(self, task_id: str) -> bool:
+        redis = await get_redis()
+        val = await redis.get(f"cancelled_{task_id}")
+        return val == b"1"
+
+    async def check_cancelled(self, task_id: str):
+        """Called inside graph execution loops to raise exception if task is cancelled."""
+        if await self.is_cancelled(task_id):
+            logger.info(f"Task {task_id} cancellation detected via Redis.")
+            raise TaskCancelledException(f"Task {task_id} was cancelled by human operator.")
+
     def remove(self, task_id: str):
-        # We can clean up the redis key in the background
+        # We can clean up the redis keys in the background
         asyncio.create_task(self.resume(task_id))
 
 task_control = TaskControl()

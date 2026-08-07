@@ -13,43 +13,78 @@ import urllib.parse
 from loguru import logger
 import json
 import re
+try:
+    from ddgs import DDGS
+    _DDGS_AVAILABLE = True
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS
+        _DDGS_AVAILABLE = True
+    except ImportError:
+        _DDGS_AVAILABLE = False
+        logger.warning("[SEARCH] Neither 'ddgs' nor 'duckduckgo_search' installed. Run: pip install ddgs")
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, groq_api_key=settings.GROQ_API_KEY)
 
 # Sabhi login/bot-walled sites block hain (substring matching for all TLDs)
 BLOCKED_DOMAINS = ["glassdoor", "linkedin", "indeed", "monster", "naukri", "shine"]
 
+# Sites that return 403 to Playwright headless browsers — skip direct visits
+_BOT_BLOCKED_DIRECT = ["wellfound.com", "himalayas.app"]
+
 def _is_blocked(url: str) -> bool:
     return any(b in url for b in BLOCKED_DOMAINS)
 
+def _is_bot_blocked(url: str) -> bool:
+    """Sites that block headless browsers with 403."""
+    return any(b in url for b in _BOT_BLOCKED_DIRECT)
+
+def _is_root_homepage(url: str) -> bool:
+    """Detects B2B marketing root homepages which do not contain job listings."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.strip('/')
+        # Only block if path is empty or a generic marketing page
+        if not path or path in ["index.html", "home", "en", "about", "product", "pricing"]:
+            # But allow actual job-board domains even if path seems short
+            if parsed.netloc in ["job-boards.greenhouse.io", "jobs.lever.co", "apply.workable.com", "jobs.workable.com"]:
+                return False
+            return True
+    except Exception:
+        pass
+    return False
+
+def _normalize_query_domains(query: str) -> str:
+    """Normalize ATS domain aliases to correct job-board subdomains."""
+    # All greenhouse variants → job-boards.greenhouse.io
+    query = re.sub(r'\bsite:jobs\.greenhouse\.io\b', 'site:job-boards.greenhouse.io', query)
+    query = re.sub(r'\bsite:boards\.greenhouse\.io\b', 'site:job-boards.greenhouse.io', query)
+    query = re.sub(r'\bsite:greenhouse\.io\b', 'site:job-boards.greenhouse.io', query)
+    # Workable variants → apply.workable.com (correct job listing subdomain)
+    query = re.sub(r'\bsite:jobs\.workable\.com\b', 'site:apply.workable.com', query)
+    query = re.sub(r'\bsite:apply\.workable\.com\b', 'site:apply.workable.com', query)
+    query = re.sub(r'\bsite:workable\.com\b', 'site:apply.workable.com', query)
+    # Ashby
+    query = re.sub(r'\bsite:ashbyhq\.com\b', 'site:jobs.ashbyhq.com', query)
+    return query
+
+def _execute_ddg_search_sync(query: str, max_results: int = 15) -> list:
+    """Run DuckDuckGo search synchronously (call via run_in_executor). Returns list of {title, url}."""
+    if not _DDGS_AVAILABLE:
+        return []
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return [{"title": r.get("title", ""), "url": r.get("href", "")} for r in results if r.get("href")]
+    except Exception as e:
+        logger.warning(f"[SEARCH] DDGS search failed: {e}")
+        return []
+
 @tool
 async def search_internet(query: str) -> str:
-    """Searches the open internet using DuckDuckGo with the EXACT user query."""
+    """Searches the open internet for job listings. Run this first to find real job URLs."""
     logger.info(f"[TOOL CALL] search_internet called with query: '{query}'")
-    try:
-        search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        await asyncio.sleep(3)
-        await browser_controller.goto(search_url)
-        results = await browser_controller.get_search_results(max_results=settings.MAX_SEARCH_RESULTS)
-
-        if not results:
-            return f"No search results found for '{query}'. Try a different search term."
-
-        filtered = [r for r in results if r.get("url") and not _is_blocked(r["url"])]
-
-        if not filtered:
-            return f"All top results require login or are blocked. Try another search query."
-
-        formatted = "\n".join([f"- {r['title'].strip()} -> {r['url']}" for r in filtered])
-        logger.info(f"[TOOL RESULT] Search successful. Found {len(filtered)} web results.")
-        return (
-            f"Search results for '{query}':\n{formatted}\n\n"
-            f"INSTRUCTION: Call visit_webpage with ONE of the EXACT URLs listed above. "
-            f"Do not invent URLs. If the first site doesn't have jobs or asks for login, visit the next URL."
-        )
-    except Exception as e:
-        logger.error(f"[TOOL ERROR] search_internet failed: {e}")
-        return f"ERROR: Search failed. Try a different query."
+    return f"Search triggered for query: '{query}'"
 
 @tool
 async def visit_webpage(url: str) -> str:
@@ -77,7 +112,27 @@ async def visit_webpage(url: str) -> str:
         logger.error(f"[TOOL ERROR] visit_webpage failed: {e}")
         return f"ERROR: Could not open '{url}'."
 
-tools = [search_internet, visit_webpage]
+@tool
+async def click_element(target: str) -> str:
+    """Clicks a button, link, or interactive element on the current webpage matching the target text or description."""
+    logger.info(f"[TOOL CALL] click_element called with target: '{target}'")
+    try:
+        return await browser_controller.click_element(target)
+    except Exception as e:
+        logger.error(f"[TOOL ERROR] click_element failed: {e}")
+        return f"ERROR: Could not click '{target}': {e}"
+
+@tool
+async def fill_input(target: str, value: str) -> str:
+    """Types value into a text input field, search box, or form field matching the placeholder, label, or name."""
+    logger.info(f"[TOOL CALL] fill_input called with target: '{target}', value: '{value}'")
+    try:
+        return await browser_controller.fill_input(target, value)
+    except Exception as e:
+        logger.error(f"[TOOL ERROR] fill_input failed: {e}")
+        return f"ERROR: Could not fill input '{target}': {e}"
+
+tools = [search_internet, visit_webpage, click_element, fill_input]
 llm_with_tools = llm.bind_tools(tools)
 
 def _trim_messages(messages):
@@ -94,6 +149,7 @@ async def agent_node(state: AgentState):
     task_id = state.get("task_id", "")
     if task_id:
         await task_control.check_paused(task_id)
+        await task_control.check_cancelled(task_id)
         
     messages = state.get("messages", [])
     tool_call_count = state.get("tool_call_count", 0)
@@ -102,27 +158,33 @@ async def agent_node(state: AgentState):
     if not messages:
         logger.info(f"[GRAPH] Initializing new agent task for goal: '{state['goal']}'")
         sys_msg = SystemMessage(content=(
-            "You are an Autonomous AI Job Researcher. Your goal is to find real, working job listings without getting blocked by login walls. "
-            "1. Take the user's EXACT goal and build a DuckDuckGo search query. Prefer well-known open job boards/ATS platforms "
-            "(e.g. site:greenhouse.io, site:lever.co, site:remoteok.com, site:wellfound.com, site:himalayas.app, site:weworkremotely.com) "
-            "but you are NOT limited to only these — a plain open query (no site: filter) is also valid, especially if a site-restricted search returns few results. "
-            "DO NOT modify the user's core intent (role, location, seniority). "
-            "2. Pass the query to 'search_internet'. If results look thin or mostly blocked, call 'search_internet' again with a DIFFERENT, broader phrasing "
-            "(drop the site: filter, add words like 'careers apply', or try a different job board) instead of giving up. "
-            "3. Call 'visit_webpage' on the most relevant job listing URLs from the results. "
-            "4. If a website asks for login, shows CAPTCHA, returns a broken/dead link (HTTP error), or fails to load, SKIP it immediately and visit the next URL. DO NOT GIVE UP. "
-            "5. LINK EXTRACTION RULE (IMPORTANT): When a page lists MULTIPLE jobs, do NOT use the current page's own URL as the job link. "
-            "Instead, look at the '--- AVAILABLE LINKS ON PAGE ---' section returned with the page text, and pick the specific href whose "
-            "link text matches that job's title (the real apply/detail link). Only use the current page URL directly if that page itself IS a single job's description page. "
-            "Never output a bare homepage, root careers listing, or root domain URL as a job's link. "
-            "6. TARGET JOB LISTING COUNT: Visit multiple job URLs from search results to collect several matching job listings, not just one. "
-            "7. Respond with ONLY a JSON array of objects with keys: 'title', 'company', 'location', 'salary', 'posted_date', 'link'. No extra conversational text or formatting. "
-            "Extract 'salary' (e.g. '$120,000' or '₹15LPA' or 'Not disclosed') and 'posted_date' (e.g. '2 days ago' or 'Recently') if mentioned in the page text.\n"
-            "CRITICAL BLOCKLIST RULE: NEVER visit indeed.com, linkedin.com, glassdoor.com, glassdoor.co.in, naukri.com, monster.com, or shine.com. They are strictly blocked and require login. If you see them in search results, skip them and do NOT call visit_webpage on them. Only visit open ATS portals, greenhouse.io, lever.co, remoteok.com, or wellfound.com.\n"
-            "CRITICAL FOCUS RULE: You must ONLY visit or search for actual job postings, job boards, or career pages. "
-            "NEVER search for company history, products, reviews, pricing, founders, or general platform support. "
-            "NEVER visit generic platform help links or company homepages which do not list open jobs. "
-            "If a webpage is not a job description or job board, skip it immediately, return to your search results, and try the next job URL."
+            "You are an Autonomous AI Job RESEARCH Assistant. Your ONLY goal is to FIND and REPORT job listings — you NEVER apply for jobs. "
+
+            "SEARCH STRATEGY (CRITICAL): "
+            "1. Always start with 'search_internet'. Use a SIMPLE, PLAIN query — role + location + the word 'jobs'. "
+            "   GOOD: 'AI ML Engineer jobs Bengaluru', 'Software Developer jobs remote'. "
+            "   BAD: any query with site: filters. The system automatically filters results. "
+            "2. If the search returns 0 results, call search_internet ONCE MORE with slightly different phrasing. "
+            "3. After getting search results, call 'visit_webpage' on 3-5 specific job posting URLs in a SINGLE iteration. "
+
+            "VISITING RULES: "
+            "4. NEVER visit a root homepage (apply.workable.com/, job-boards.greenhouse.io/) — no job content there. "
+            "5. If a page says 'Sign in', 'Create Account', 'Login required', or 'Sorry!' → it is a login wall. SKIP it immediately. "
+            "6. If a page returns HTTP 403, 404, 410 or CAPTCHA — SKIP immediately. "
+
+            "STRICTLY FORBIDDEN ACTIONS (NEVER do these): "
+            "7. NEVER click 'Apply', 'Quick apply', 'Apply Now', 'Submit application', 'Post a job', 'Hire', 'Employer Login'. "
+            "8. NEVER fill in 'Name', 'Email', 'Phone', 'Resume', 'Cover Letter', 'Password' fields. "
+            "9. You are a READ-ONLY research agent. You can only use 'click_element' and 'fill_input' for SEARCH FORMS (typing a job role into a search box). "
+
+            "COMPILING RESULTS: "
+            "10. After visiting pages, compile a JSON array from the text you read. Each object: "
+            "    'title', 'company', 'location', 'salary' (or 'Not disclosed'), 'posted_date' (or 'Recently'), 'link' (specific job detail URL). "
+            "11. The link must be a specific job page URL — NEVER a homepage or root domain. "
+            "12. If a page lists multiple jobs with links in '--- AVAILABLE LINKS ON PAGE ---', use those specific job links. "
+            "13. If no jobs found, return []. "
+
+            "BLOCKED SITES (NEVER visit): indeed.com, linkedin.com, glassdoor.com, naukri.com, monster.com, shine.com, wellfound.com, himalayas.app."
         ))
         messages = [sys_msg, HumanMessage(content=state["goal"])]
 
@@ -185,7 +247,9 @@ async def agent_node(state: AgentState):
 
         # 3. If step 0 initial search call failed, construct default initial search tool call
         if tool_call_count == 0:
-            query = f"{state['goal']} site:greenhouse.io OR site:lever.co OR site:remoteok.com"
+            # Use plain query WITHOUT site: filter — site: filters fail on ATS subdomains in Bing/DDG
+            goal = state.get('goal', 'software developer jobs')
+            query = f"{goal} jobs apply now"
             logger.info(f"[GRAPH] Initial step search recovery tool call: search_internet with query: '{query}'")
             recovery_msg = AIMessage(
                 content="",
@@ -334,10 +398,12 @@ async def tool_node(state: AgentState):
     task_id = state.get("task_id", "")
     if task_id:
         await task_control.check_paused(task_id)
+        await task_control.check_cancelled(task_id)
         
     controller = await browser_manager.get_or_create(task_id) if task_id else browser_controller
     last_message = state["messages"][-1]
     tool_outputs = []
+    last_page_failed = False
     
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
@@ -346,34 +412,61 @@ async def tool_node(state: AgentState):
         try:
             if tool_name == "search_internet":
                 query = tool_args.get("query", "")
-                search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-                await asyncio.sleep(2)
-                await controller.goto(search_url)
-                results = await controller.get_search_results(max_results=settings.MAX_SEARCH_RESULTS)
-                filtered = [r for r in results if r.get("url") and not _is_blocked(r["url"])]
+                # Remove any blocked site filters the LLM may have added
+                query = re.sub(r'site:(indeed|linkedin|glassdoor|naukri|monster|shine|wellfound|himalayas)\.\S+', '', query, flags=re.IGNORECASE).strip()
+                # Also remove ALL site: filters — they cause 0 results on ATS subdomains
+                # We rely on result-level domain filtering instead
+                clean_query = re.sub(r'\s*site:\S+(\s+OR\s+site:\S+)*', '', query).strip()
+                if not clean_query:
+                    clean_query = query
+                logger.info(f"[GRAPH] Final search query (site: stripped): '{clean_query}'")
 
+                # --- STEP 1: Try DDGS first (fast, no 403, no Playwright needed) ---
+                filtered = []
+                if _DDGS_AVAILABLE:
+                    logger.info(f"[GRAPH] Trying DDGS search for: '{clean_query}'")
+                    loop = asyncio.get_running_loop()
+                    raw_ddg = await loop.run_in_executor(None, _execute_ddg_search_sync, clean_query, 20)
+                    for r in raw_ddg:
+                        url = r.get("url", "")
+                        title = r.get("title", "")
+                        if url and not _is_blocked(url) and not _is_bot_blocked(url):
+                            filtered.append({"title": title.strip(), "url": url})
+                    logger.info(f"[GRAPH] DDGS returned {len(filtered)} usable results.")
+
+                # --- STEP 2: If DDGS returned nothing, fallback to Bing via Playwright ---
                 if not filtered:
-                    # Level-3: Smart Query Mutation. Sab results login-walled/empty nikle,
-                    # toh site: restriction hata kar aur alag ATS boards try karke automatically dobara search karo.
-                    broadened_query = re.sub(r'\s*site:\S+(\s+OR\s+site:\S+)*', '', query).strip()
-                    broadened_query = f"{broadened_query} careers apply site:wellfound.com OR site:himalayas.app OR site:weworkremotely.com"
-                    logger.info(f"[GRAPH] Level-3 Smart Query Mutation triggered. '{query}' had 0 usable results -> retrying with '{broadened_query}'")
-                    search_url2 = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(broadened_query)}"
+                    search_url = f"https://www.bing.com/search?q={urllib.parse.quote(clean_query)}"
+                    logger.info(f"[GRAPH] DDGS empty. Falling back to Playwright Bing Search: {search_url}")
                     await asyncio.sleep(2)
-                    await controller.goto(search_url2)
-                    results2 = await controller.get_search_results(max_results=settings.MAX_SEARCH_RESULTS)
-                    filtered = [r for r in results2 if r.get("url") and not _is_blocked(r["url"])]
-                    query = broadened_query
+                    await controller.goto(search_url)
+                    raw_bing = await asyncio.get_running_loop().run_in_executor(
+                        controller.executor,
+                        lambda: controller.page.eval_on_selector_all(
+                            "li.b_algo h2 a",
+                            "els => els.map(el => ({title: el.innerText, url: el.href}))"
+                        )
+                    )
+                    for r in raw_bing:
+                        url = r.get("url", "")
+                        title = r.get("title", "")
+                        if url and not _is_blocked(url) and not _is_bot_blocked(url):
+                            filtered.append({"title": title.strip(), "url": url})
+                    logger.info(f"[GRAPH] Bing returned {len(filtered)} usable results.")
 
                 if filtered:
-                    formatted = "\n".join([f"- {r['title'].strip()} -> {r['url']}" for r in filtered])
-                    result = f"Search results for '{query}':\n{formatted}"
+                    formatted = "\n".join([f"- {r['title']} -> {r['url']}" for r in filtered[:settings.MAX_SEARCH_RESULTS]])
+                    result = f"Search results for '{clean_query}':\n{formatted}"
                 else:
-                    result = f"No usable results found for '{query}' even after broadening the search. Try a completely different query/job board."
+                    result = f"No usable results found for '{clean_query}'. Try a different search query or visit https://apply.workable.com directly."
             elif tool_name == "visit_webpage":
                 target_url = tool_args.get("url", "")
                 if _is_blocked(target_url):
                     result = f"SKIPPED: '{target_url}' requires login."
+                    last_page_failed = True
+                elif _is_bot_blocked(target_url):
+                    result = f"SKIPPED: '{target_url}' blocks automated browsers. Try a different URL."
+                    last_page_failed = True
                 else:
                     await asyncio.sleep(2)
                     await controller.goto(target_url)
@@ -381,14 +474,63 @@ async def tool_node(state: AgentState):
                     if status is not None and status >= 400:
                         logger.warning(f"[TOOL WARNING] Page '{target_url}' returned HTTP {status} (dead/broken link).")
                         result = f"ERROR: '{target_url}' returned HTTP {status} (broken/dead link). SKIP this URL and try the next one from search results."
+                        last_page_failed = True
                     else:
                         text = await controller.get_page_text()
-                        lower_text = text.lower()[:1500]
-                        if "captcha" in lower_text or "cloudflare" in lower_text or "access denied" in lower_text or "403 forbidden" in lower_text:
-                            logger.warning(f"[TOOL WARNING] Page '{target_url}' is protected by CAPTCHA or security block.")
-                            result = "This page is protected by CAPTCHA or security block. Try another URL from search results."
+                        lower_text = text.lower()[:2000]
+                        # Detect login/signup walls (site returns 200 but requires account)
+                        _LOGIN_WALL_SIGNALS = [
+                            "captcha", "cloudflare", "access denied", "403 forbidden",
+                            "create new account", "create an account", "sign in to continue",
+                            "sign up to view", "join to get early access", "join talent500",
+                            "login to view", "login required", "please log in", "please sign in",
+                            "verify you are human", "one last step"
+                        ]
+                        login_wall_hit = any(sig in lower_text for sig in _LOGIN_WALL_SIGNALS)
+                        if login_wall_hit:
+                            logger.warning(f"[TOOL WARNING] Page '{target_url}' is behind a login/signup wall.")
+                            result = f"LOGIN WALL: '{target_url}' requires account creation or sign-in. SKIP this URL entirely."
+                            last_page_failed = True
                         else:
                             result = text[:settings.MAX_PAGE_TEXT_CHARS]
+                            last_page_failed = False
+            elif tool_name in ["click_element", "fill_input"]:
+                if last_page_failed:
+                    result = f"SKIPPED: Target webpage visit failed or was blocked."
+                elif tool_name == "fill_input":
+                    target = tool_args.get("target", "")
+                    value = tool_args.get("value", "")
+                    # Hard-block personal info form fills (job application actions)
+                    _APPLICATION_FIELDS = ["name", "email", "phone", "mobile", "resume", "cv",
+                                           "cover letter", "linkedin", "portfolio", "password",
+                                           "first name", "last name", "full name"]
+                    if any(f in target.lower() for f in _APPLICATION_FIELDS):
+                        logger.warning(f"[GUARDRAIL] BLOCKED fill_input on personal/application field '{target}' — research-only agent.")
+                        result = f"BLOCKED: Filling '{target}' is forbidden. This agent only researches jobs, it does not apply for them."
+                    else:
+                        result = await controller.fill_input(target, value)
+                elif tool_name == "click_element":
+                    target = tool_args.get("target", "")
+                    # Hard-block job application submit buttons
+                    _APPLY_KEYWORDS = ["apply now", "quick apply", "easy apply", "submit application",
+                                       "submit resume", "send application", "register to apply"]
+                    if any(kw in target.lower() for kw in _APPLY_KEYWORDS):
+                        logger.warning(f"[GUARDRAIL] BLOCKED click on job-application button '{target}' — research-only agent.")
+                        result = f"BLOCKED: Clicking '{target}' is forbidden. Compile the job listing info from page text instead."
+                    elif any(kw in target.lower() for kw in ["apply", "submit", "register", "send"]):
+                        logger.info(f"[GUARDRAIL] Triggering human approval check before clicking sensitive button '{target}'")
+                        await ws_manager.send_status_update(task_id, "pending_approval", f"Agent wants to click '{target}'")
+                        await ws_manager.send_timeline_event(task_id, "approval_required", {
+                            "message": f"Human Guardrail: Agent wants to click '{target}'. Do you approve this action?"
+                        })
+                        approved = await wait_for_approval(task_id)
+                        await ws_manager.send_status_update(task_id, "running", "Execution resumed")
+                        if not approved:
+                            result = f"ACTION CANCELLED: Human operator rejected clicking '{target}'."
+                        else:
+                            result = await controller.click_element(target)
+                    else:
+                        result = await controller.click_element(target)
             else:
                 logger.warning(f"[GRAPH] Unknown tool requested: '{tool_name}'")
                 result = f"ERROR: Unknown tool."
