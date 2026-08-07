@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+agentflow.db
+.pytest_cache/
+.github/
+Dockerfile
+.dockerignore
