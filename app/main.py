@@ -51,10 +51,31 @@ def create_app() -> FastAPI:
         lifespan=lifespan
     )
 
-    # CORS configuration (Allow all for dev)
+    # CORS configuration
+    import json
+    origins = ["http://localhost:3000", "https://agentsflow.netlify.app"]
+    if hasattr(settings, "CORS_ORIGINS"):
+        try:
+            if isinstance(settings.CORS_ORIGINS, list):
+                origins.extend(settings.CORS_ORIGINS)
+            elif isinstance(settings.CORS_ORIGINS, str):
+                try:
+                    loaded = json.loads(settings.CORS_ORIGINS)
+                    if isinstance(loaded, list):
+                        origins.extend(loaded)
+                    else:
+                        origins.append(settings.CORS_ORIGINS)
+                except Exception:
+                    origins.append(settings.CORS_ORIGINS)
+        except Exception:
+            pass
+            
+    # Clean origins
+    origins = list(set([o.strip().rstrip("/") for o in origins if o and isinstance(o, str)]))
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "https://yourdomain.com"],  # Changed to * for dev to avoid CORS issues
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
